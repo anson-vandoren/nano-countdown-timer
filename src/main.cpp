@@ -1,17 +1,18 @@
 #include <Arduino.h>
 #include <avr/interrupt.h>
 #include <limits.h>
+#include <EEPROM.h>
 
 #define GREEN_LED 3
 #define RED_LED 4
 
 // IMPORTANT: change PCMSK1 (and possibly PCICR) if changing these pin numbers
-#define BUTTON_PIN A0
-#define CLK A1
-#define DT A2
+#define BUTTON_PIN A0 // either integral with rotary encoder, or standalone
+#define CLK A1        // rotary encoder CLK or 'A' pin
+#define DT A2         // rotary encoder DT or 'B' pin
 
-#define SCK 5
-#define SDL 6
+#define SCK 5 // shift register serial clock line
+#define SDL 6 // shift register serial data line
 
 const int INPUT_MODE_DELAY = 1000;               // go into input mode after button is pressed for this duration
 const uint8_t DEBOUNCE_DELAY = 50;               // how many milliseconds in same state to call it a real change
@@ -24,11 +25,58 @@ volatile unsigned long flashRedUntil = 0;
 
 unsigned long showCounterUntil = 0;
 
-const unsigned long TIMER_INTERVAL = 3600000; // 1hr, in milliseconds
+unsigned long timerInterval = 3600000; // 1hr, in milliseconds
 
-bool isInputMode = false;
-
+volatile uint8_t inputMode = 0;
 volatile unsigned long lastDebounceTime = 0;
+
+void handleButtonPress(bool isPressed);
+
+void showValue(byte value, unsigned long duration = ULONG_MAX)
+{
+  shiftOut(SDL, SCK, MSBFIRST, value);
+  showCounterUntil = millis() + duration;
+}
+
+void incrementMode()
+{
+  inputMode++;
+  Serial.print("inputMode=");
+  Serial.println(inputMode);
+  byte intervalMinutes;
+  switch (inputMode)
+  {
+  case 1:
+    // adjust the timer interval
+    flashGreenUntil = flashRedUntil = showCounterUntil = 0;
+    digitalWrite(GREEN_LED, HIGH);
+    digitalWrite(RED_LED, LOW);
+    intervalMinutes = (byte)(timerInterval / (1000UL * 60UL)); // milliseconds to minutes
+    Serial.print("intervalMinutes: ");
+    Serial.println(intervalMinutes);
+    showValue(intervalMinutes);
+    break;
+  case 2:
+    // just left the timer interval adjustment, so write it to EEPROM if it changed
+    intervalMinutes = (byte)(timerInterval / (60000UL));
+    EEPROM.update(0, intervalMinutes);
+    digitalWrite(GREEN_LED, LOW);
+    digitalWrite(RED_LED, HIGH);
+    break;
+  default:
+    // bad case or wrapped, so reset and break
+    inputMode = 0;
+    Serial.println("Exited input mode.");
+    digitalWrite(GREEN_LED, LOW);
+    digitalWrite(RED_LED, LOW);
+    shiftOut(SDL, SCK, MSBFIRST, 0);
+    lastDebounceTime = 0;
+    handleButtonPress(true); // simulate additional button press to show time left and blinkenlights
+    break;
+    return;
+  }
+}
+
 void handleButtonPress(bool isPressed)
 {
   // debounce the button
@@ -38,28 +86,27 @@ void handleButtonPress(bool isPressed)
 
   if (!isPressed)
   {
+    // ISR triggered on the button being released
     pressedSince = ULONG_MAX; // reset, since button is no longer pressed
     return;
   }
 
-  if (isPressed && isInputMode)
+  if (isPressed && inputMode > 0)
   {
-    isInputMode = false;
-    Serial.println("Exited input mode.");
+    // button was pressed when already in an input mode
+    incrementMode();
     return;
   }
 
   pressedSince = millis(); // start tracking how long the button is held in for
 
   unsigned long secondsLeft = (timerEndMillis - millis()) / 1000;
-  if (timerEndMillis == 0)
+  if (timerEndMillis == 0) // timer hasn't started yet
   {
-    // timer hasn't started yet
     secondsLeft = 0;
   }
-  else if (secondsLeft > TIMER_INTERVAL / 1000)
+  else if (secondsLeft > timerInterval / 1000) // timer has already elapsed
   {
-    // timer has already elapsed
     secondsLeft = 0;
   }
 
@@ -71,9 +118,9 @@ void handleButtonPress(bool isPressed)
   else if (secondsLeft == 0)
   {
     // time is up - show the green LED
-    flashGreenUntil = 3000;
-    timerEndMillis = millis() + TIMER_INTERVAL; // reset the timer for a new interval
-    secondsLeft = TIMER_INTERVAL / 1000;
+    flashGreenUntil = millis() + 15000;
+    timerEndMillis = millis() + timerInterval; // reset the timer for a new interval
+    secondsLeft = timerInterval / 1000;
   }
   Serial.print("Button pressed. Time remaining: ");
   Serial.println(secondsLeft);
@@ -82,8 +129,7 @@ void handleButtonPress(bool isPressed)
   byte minutesLeft = (byte)(secondsLeft / 60);
   Serial.print("Minutes remaining: ");
   Serial.println((int)minutesLeft);
-  shiftOut(SDL, SCK, MSBFIRST, minutesLeft);
-  showCounterUntil = millis() + 5000; // show the remaining time on the display for 5 seconds
+  showValue(minutesLeft, 5000);
 }
 
 void setup()
@@ -112,6 +158,9 @@ void setup()
   pinMode(GREEN_LED, OUTPUT);
   digitalWrite(RED_LED, LOW);
   pinMode(RED_LED, OUTPUT);
+
+  // get timer interval from EEPROM
+  timerInterval = EEPROM.read(0) * 60000UL;
 
   Serial.begin(115200);
 }
@@ -146,6 +195,30 @@ uint8_t read_rotary()
   return 0;
 }
 
+void doEncoderStep(bool isCw)
+{
+  int newIntervalMinutes;
+  switch (inputMode)
+  {
+  case 0:
+    return;
+  case 1:
+    // change the timer interval
+    newIntervalMinutes = (timerInterval / 60000) + (isCw ? 1 : -1);
+    if (newIntervalMinutes > 256)
+      newIntervalMinutes = 256;
+    if (newIntervalMinutes < 0)
+      newIntervalMinutes = 0;
+    timerInterval = newIntervalMinutes * 60000;
+    showValue(newIntervalMinutes);
+    break;
+
+  case 2:
+  default:
+    return;
+  }
+}
+
 void handleEncoder()
 {
 
@@ -159,11 +232,13 @@ void handleEncoder()
     {
       Serial.print("eleven ");
       Serial.println(store, HEX);
+      doEncoderStep(false);
     }
     if ((prevNextCode & 0x0f) == 0x07)
     {
       Serial.print("seven ");
       Serial.println(store, HEX);
+      doEncoderStep(true);
     }
   }
 }
@@ -226,14 +301,19 @@ void loop()
 {
   static unsigned long lastRedChange = 0;
   static unsigned long lastGreenChange = 0;
-  if (pressedSince < ULONG_MAX)
+  if (pressedSince < ULONG_MAX) // button is currently held down
   {
     int buttonMillis = millis() - pressedSince;
-    if (buttonMillis > INPUT_MODE_DELAY && !isInputMode)
+    if (buttonMillis > INPUT_MODE_DELAY && inputMode == 0)
     {
-      isInputMode = true;
-      Serial.println("Entered input mode.");
+      incrementMode();
+      return;
     }
+  }
+
+  if (inputMode > 0)
+  {
+    return;
   }
 
   tryFlash(flashGreenUntil, lastGreenChange, GREEN_LED);
@@ -242,7 +322,7 @@ void loop()
   int counterRemaining = showCounterUntil - millis();
   if (showCounterUntil != 0 && counterRemaining < 0)
   {
-    shiftOut(SDL, SCK, MSBFIRST, 0); // shift all zeros to the display
-    showCounterUntil = 0;            // don't keep checking and shifting out zeros
+    showValue(0);         // clear the display
+    showCounterUntil = 0; // don't keep checking and shifting out zeros
   }
 }
