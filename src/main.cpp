@@ -20,7 +20,7 @@
 #endif
 
 #ifndef SHIFT_DISPLAY
-const uint8_t display_arr[] = {BAR_0, BAR_1, BAR_2, BAR_3, BAR_4, BAR_5, BAR_6, BAR_7};
+const uint8_t display_arr[] = {BAR_0, BAR_1, BAR_2, BAR_3, BAR_4, BAR_5, BAR_6, BAR_7};  // LSB -> MSB
 #else
 const uint8_t display_arr[] = {};
 #endif
